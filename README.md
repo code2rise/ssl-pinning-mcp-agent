@@ -297,7 +297,7 @@ No API keys are required — this server provides the *tool*, not the *model*. T
 ### Step 1 — Clone the repository
 
 ```bash
-git clone https://github.com/code2rise/ssl-pinning-agent
+git clone https://github.com/code2rise/ssl-pinning-mcp-agent
 cd ssl-tasks-mcp-agents
 ```
 

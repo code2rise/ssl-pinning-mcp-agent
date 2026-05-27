@@ -25,6 +25,7 @@ An **MCP (Model Context Protocol) server** that exposes an SSL certificate pinni
 12. [End-to-End Flow Walkthrough](#12-end-to-end-flow-walkthrough)
 13. [Evolution from Tool-Calling Agent to MCP](#13-evolution-from-tool-calling-agent-to-mcp)
 14. [Known Limitations & Troubleshooting](#14-known-limitations--troubleshooting)
+15. [Claude Code MCP Configuration: Priority Order & Actual Setup](#15-claude-code-mcp-configuration-priority-order--actual-setup)
 
 ---
 
@@ -196,6 +197,7 @@ The `openssl` binary is pre-installed on macOS and Linux. Using it via `subproce
 ```
 ssl-tasks-mcp-agents/
 ├── server.py                          # MCP server entry point
+├── start_server.sh                    # Convenience script to launch the server
 ├── tools/
 │   ├── __init__.py
 │   └── ssl_pinning_hash_generator.py  # Tool: fetches cert, computes SPKI hash
@@ -208,6 +210,10 @@ ssl-tasks-mcp-agents/
 ### `server.py`
 
 Registers the `generate_ssl_pin` tool with FastMCP and starts the server. The transport (SSE vs Streamable-HTTP) is controlled by the `MCP_TRANSPORT` environment variable.
+
+### `start_server.sh`
+
+Convenience shell script that activates the virtual environment, validates prerequisites (venv present, port free), and launches `server.py` with the correct transport. Accepts two optional arguments: transport (`sse` or `http`) and port number. See [Section 9](#9-running-the-mcp-server) for full usage.
 
 ### `tools/ssl_pinning_hash_generator.py`
 
@@ -333,46 +339,95 @@ python3 -c "from mcp.server.fastmcp import FastMCP; print('FastMCP OK')"
 
 ## 9. Running the MCP Server
 
-The server is started by running `server.py`. The transport is selected via the `MCP_TRANSPORT` environment variable.
+The recommended way to start the server is `start_server.sh` — it activates the virtual environment, checks that the target port is free, and launches `server.py` with the correct transport in one step.
 
-### SSE transport (default)
+### `start_server.sh` — usage
 
-Use this for **Continue.dev**, older MCP clients, and any client that connects to a URL endpoint.
+```bash
+# Make executable (first time only)
+chmod +x start_server.sh
+
+# SSE transport (default) — for Continue.dev and older MCP clients
+./start_server.sh
+
+# Streamable-HTTP transport — for Claude Code and Claude Desktop
+./start_server.sh http
+
+# Explicit SSE
+./start_server.sh sse
+
+# Custom port (transport + port)
+./start_server.sh http 9000
+./start_server.sh sse 9000
+```
+
+### What the script does
+
+1. Resolves the transport from the first argument (`sse` default, `http` for Streamable-HTTP)
+2. Checks that `.venv/` exists — prints setup instructions and exits if missing
+3. Checks that the target port is free — exits with a clear message if occupied
+4. Activates the virtual environment
+5. Launches `server.py` with `MCP_TRANSPORT` and `PORT` set
+
+### Startup output
+
+```
+  SSL Pinning MCP Server
+  ──────────────────────────────────────────
+  Transport : streamable-http
+  Endpoint  : http://localhost:8000/mcp
+  Ctrl+C    : stop the server
+  ──────────────────────────────────────────
+
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+```
+
+### Endpoints by transport
+
+| Transport | Command | Endpoint |
+|---|---|---|
+| SSE | `./start_server.sh` | `http://localhost:8000/sse` |
+| Streamable-HTTP | `./start_server.sh http` | `http://localhost:8000/mcp` |
+
+### Manual launch (without the script)
+
+If you prefer to launch directly:
 
 ```bash
 source .venv/bin/activate
+
+# SSE
 python3 server.py
-```
 
-The server starts at `http://localhost:8000/sse` by default.
-
-### Streamable-HTTP transport
-
-Use this for **Claude Code**, **Claude Desktop**, **Cursor**, and newer MCP clients.
-
-```bash
-source .venv/bin/activate
+# Streamable-HTTP
 MCP_TRANSPORT=streamable-http python3 server.py
-```
 
-The server starts at `http://localhost:8000/mcp` by default.
-
-### Custom port
-
-```bash
+# Custom port
 MCP_TRANSPORT=streamable-http PORT=9000 python3 server.py
 ```
 
 ### Verifying the server is running
 
-```bash
-# For Streamable-HTTP
-curl -s -X POST http://localhost:8000/mcp \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | python3 -m json.tool
+Use the `mcp` Python client to confirm the tool is discoverable and callable:
 
-# Expected: a JSON response listing the generate_ssl_pin tool
+```python
+import asyncio
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+async def test():
+    async with streamablehttp_client("http://localhost:8000/mcp") as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = await session.list_tools()
+            print([t.name for t in tools.tools])
+            result = await session.call_tool("generate_ssl_pin", {"cert_input": "https://github.com"})
+            print(result.content[0].text)
+
+asyncio.run(test())
 ```
+
+For SSE, replace `streamablehttp_client` with `sse_client` from `mcp.client.sse` and connect to `http://localhost:8000/sse`.
 
 ---
 
@@ -380,17 +435,18 @@ curl -s -X POST http://localhost:8000/mcp \
 
 ### 10.1 Claude Code (CLI)
 
-Claude Code reads MCP server configuration from `.claude/settings.json` in your project directory or from `~/.claude/settings.json` globally.
+Claude Code supports multiple configuration approaches for MCP servers. The **recommended approach** (and what was used in this project) is `~/.mcp.json` + `enabledMcpjsonServers`. See [Section 15](#15-claude-code-mcp-configuration-priority-order--actual-setup) for the full priority order and step-by-step walkthrough.
 
-**Step 1 — Ensure the server is running** (Streamable-HTTP transport):
+#### Approach A — `~/.mcp.json` (Recommended, used in this project)
+
+**Step 1 — Start the server** (Streamable-HTTP transport):
 
 ```bash
-MCP_TRANSPORT=streamable-http python3 /path/to/ssl-tasks-mcp-agents/server.py
+cd /path/to/ssl-tasks-mcp-agents
+./start_server.sh http
 ```
 
-**Step 2 — Register the server in Claude Code settings:**
-
-Add to `~/.claude/settings.json` (global, available in all projects) or `.claude/settings.json` (project-local):
+**Step 2 — Add the server to `~/.mcp.json`** (create the file if it doesn't exist):
 
 ```json
 {
@@ -403,7 +459,15 @@ Add to `~/.claude/settings.json` (global, available in all projects) or `.claude
 }
 ```
 
-**Step 3 — Use it in any Claude Code session:**
+**Step 3 — Enable the server for your project** in `<project>/.claude/settings.local.json`:
+
+```json
+{
+  "enabledMcpjsonServers": ["ssl-pinning"]
+}
+```
+
+**Step 4 — Use it in any Claude Code session in that project:**
 
 ```
 > Generate SSL pin for https://api.example.com
@@ -411,15 +475,30 @@ Add to `~/.claude/settings.json` (global, available in all projects) or `.claude
 
 Claude will automatically discover and call the `generate_ssl_pin` tool.
 
-**Alternative — Launch via Claude Code's MCP command:**
+#### Approach B — `~/.claude/settings.json` (older, always-on)
+
+Add directly under `mcpServers` in `~/.claude/settings.json` to make the server available globally in all projects without needing `enabledMcpjsonServers`:
+
+```json
+{
+  "mcpServers": {
+    "ssl-pinning": {
+      "type": "http",
+      "url": "http://localhost:8000/mcp"
+    }
+  }
+}
+```
+
+#### Approach C — Claude Code CLI command
 
 ```bash
 claude mcp add ssl-pinning --transport http http://localhost:8000/mcp
 ```
 
-**Stdio transport alternative (no background server needed):**
+#### Approach D — Stdio transport (no background server needed)
 
-If you prefer Claude Code to launch the server as a subprocess (stdio mode), configure it as:
+Claude Code launches the server as a subprocess — no need to keep a server running separately:
 
 ```json
 {
@@ -427,13 +506,12 @@ If you prefer Claude Code to launch the server as a subprocess (stdio mode), con
     "ssl-pinning": {
       "type": "stdio",
       "command": "/path/to/ssl-tasks-mcp-agents/.venv/bin/python3",
-      "args": ["/path/to/ssl-tasks-mcp-agents/server.py"]
+      "args": ["/path/to/ssl-tasks-mcp-agents/server.py"],
+      "env": { "MCP_TRANSPORT": "stdio" }
     }
   }
 }
 ```
-
-With stdio mode, `server.py` must be updated to use `mcp.run(transport="stdio")`. FastMCP supports this by default when no transport env variable is set and the process is not a server.
 
 ---
 
@@ -491,8 +569,7 @@ Continue.dev uses the SSE transport. The server must be running before Continue.
 **Step 1 — Start the server in SSE mode (default):**
 
 ```bash
-source .venv/bin/activate
-python3 server.py
+./start_server.sh
 # Server listening at http://localhost:8000/sse
 ```
 
@@ -546,7 +623,7 @@ Gemini CLI (the `gemini` command-line tool) supports MCP servers via its configu
 **Step 1 — Start the server:**
 
 ```bash
-MCP_TRANSPORT=streamable-http python3 server.py
+./start_server.sh http
 ```
 
 **Step 2 — Edit `~/.gemini/settings.json`** (create if it doesn't exist):
@@ -822,3 +899,207 @@ Final answer
 | Cert pin expires / mismatches | Server rotated its certificate | Re-run the tool to get the updated hash; add a backup pin |
 | Model answers without calling the tool | Prompt too vague or educational | Rephrase with explicit action: *"Generate the SSL pin for..."* |
 | Port 8000 already in use | Another process on the same port | `PORT=9000 python3 server.py` and update client config accordingly |
+
+---
+
+## 15. Claude Code MCP Configuration: Priority Order & Actual Setup
+
+This section documents exactly how the `ssl-pinning` MCP server was integrated with Claude Code in this system, and explains the full configuration hierarchy so you can replicate or adapt it.
+
+---
+
+### 15.1 MCP Configuration File Locations & Priority Order
+
+Claude Code reads MCP server definitions from multiple locations. When the same server name appears in more than one file, the **highest-priority file wins**. Files are evaluated in this order (1 = highest priority):
+
+| Priority | File | Scope | Notes |
+|---|---|---|---|
+| 1 | `/etc/claude/settings.json` | Enterprise / machine-wide | Managed by MDM or IT policy; read-only to users |
+| 2 | `~/.claude/settings.json` → `mcpServers` | User-global | Applies to every project on the machine |
+| 3 | `<project>/.claude/settings.json` → `mcpServers` | Project | Committed to the repo; shared with the team |
+| 4 | `<project>/.claude/settings.local.json` → `mcpServers` | Project-local | **Not** committed; personal overrides on top of project settings |
+| 5 | `~/.mcp.json` → `mcpServers` | User-global MCP registry | Dedicated MCP file; shared across all projects |
+| 6 | `<project>/.mcp.json` → `mcpServers` | Project MCP registry | Dedicated MCP file; project-scoped |
+
+> **`settings.json` vs `.mcp.json`** — both can define `mcpServers`. The `.mcp.json` files are purpose-built for MCP and are the recommended approach going forward. The `mcpServers` key inside `settings.json` is the older approach and still works, but `.mcp.json` keeps MCP config separate from general Claude Code preferences.
+
+---
+
+### 15.2 The `enabledMcpjsonServers` Filter
+
+Entries in `.mcp.json` files are **not automatically active**. Each project opts in via the `enabledMcpjsonServers` array in its `.claude/settings.local.json`:
+
+```json
+{
+  "enabledMcpjsonServers": ["ssl-pinning"]
+}
+```
+
+- Only server names listed here are loaded from `.mcp.json` for that project.
+- If the array is absent or empty, no `.mcp.json` servers are loaded for the project.
+- Servers defined directly under `mcpServers` in `settings.json` are not affected by this filter — they are always loaded.
+
+**Why this design?** A shared `~/.mcp.json` may list many servers (for different projects). The filter prevents every server being injected into every Claude Code session regardless of relevance.
+
+---
+
+### 15.3 Step-by-Step: Actual Setup Performed
+
+This documents exactly what was done to connect `ssl-pinning` to Claude Code in the `~/Workspace/AI` project.
+
+#### Step 1 — Build the MCP server
+
+`server.py` was written using FastMCP. It registers one tool (`generate_ssl_pin`) and exposes it over either SSE or Streamable-HTTP depending on the `MCP_TRANSPORT` environment variable.
+
+```
+~/Workspace/AI/ssl-tasks-mcp-agents/
+├── server.py                         ← FastMCP server (25 lines)
+├── start_server.sh                   ← launch helper
+├── tools/
+│   └── ssl_pinning_hash_generator.py ← tool logic (framework-free)
+└── requirements.txt                  ← mcp[cli]>=1.27.1
+```
+
+#### Step 2 — Create the virtual environment and install dependencies
+
+```bash
+cd ~/Workspace/AI/ssl-tasks-mcp-agents
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+`requirements.txt`:
+```
+mcp[cli]>=1.27.1
+```
+
+The `[cli]` extra includes `uvicorn` (required for Streamable-HTTP) and the `mcp` developer CLI tools.
+
+#### Step 3 — Start the server with Streamable-HTTP transport
+
+Claude Code uses the Streamable-HTTP transport (not SSE). The server was started with:
+
+```bash
+./start_server.sh http
+```
+
+This sets `MCP_TRANSPORT=streamable-http` and launches `server.py` with `uvicorn` on port 8000.
+
+```
+  SSL Pinning MCP Server
+  ──────────────────────────────────────────
+  Transport : streamable-http
+  Endpoint  : http://localhost:8000/mcp
+  Ctrl+C    : stop the server
+  ──────────────────────────────────────────
+```
+
+The server must be running before Claude Code starts (or before a session begins) for the tools to be available.
+
+#### Step 4 — Register the server in `~/.mcp.json`
+
+The file `~/.mcp.json` was created at the home directory level to make the server available globally (across all Claude Code projects on the machine):
+
+```json
+{
+  "mcpServers": {
+    "ssl-pinning": {
+      "type": "http",
+      "url": "http://localhost:8000/mcp"
+    }
+  }
+}
+```
+
+**File location:** `~/.mcp.json`
+
+- `type: "http"` selects the Streamable-HTTP transport (matches `./start_server.sh http`)
+- `url` points to the running server's MCP endpoint
+
+#### Step 5 — Opt the workspace into the server via `enabledMcpjsonServers`
+
+Creating the entry in `~/.mcp.json` alone is not enough — each project must explicitly enable servers from `.mcp.json` files. The file `.claude/settings.local.json` was created inside the `~/Workspace/AI` project directory:
+
+**File location:** `~/Workspace/AI/.claude/settings.local.json`
+
+```json
+{
+  "enabledMcpjsonServers": [
+    "ssl-pinning"
+  ]
+}
+```
+
+This tells Claude Code: *"For this project, load the `ssl-pinning` server from the `.mcp.json` registry."*
+
+This file is `.local.json` (not committed to git) because it is a personal machine-level opt-in. Team members with different local servers or ports would have their own version.
+
+#### Step 6 — Verify the connection
+
+To confirm Claude Code picked up the server, a new Claude Code session was started in `~/Workspace/AI` and a tool call was issued:
+
+```
+> Generate SSL pin for https://google.com
+```
+
+Claude Code resolved the tool via MCP, called `generate_ssl_pin`, and returned the hash.
+
+To verify the server is reachable independently:
+
+```bash
+# Check the server process is running on port 8000
+lsof -iTCP:8000 -sTCP:LISTEN
+
+# Make a direct JSON-RPC call (initialize → tools/call)
+SESSION=$(curl -s -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' \
+  -D - 2>&1 | grep -i "mcp-session-id" | awk '{print $2}' | tr -d '\r')
+
+curl -s -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "mcp-session-id: $SESSION" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"generate_ssl_pin","arguments":{"cert_input":"https://google.com"}}}'
+```
+
+---
+
+### 15.4 Configuration Summary
+
+```
+~/.mcp.json                          ← defines the server (user-global registry)
+    └── ssl-pinning: http://localhost:8000/mcp
+
+~/Workspace/AI/
+├── .claude/
+│   └── settings.local.json          ← enables ssl-pinning for this workspace only
+│       └── enabledMcpjsonServers: ["ssl-pinning"]
+│
+└── ssl-tasks-mcp-agents/
+    ├── server.py                    ← the MCP server
+    ├── start_server.sh              ← starts server on port 8000 (Streamable-HTTP)
+    └── tools/
+        └── ssl_pinning_hash_generator.py
+```
+
+**Decision rationale:**
+
+- `~/.mcp.json` was chosen over `~/.claude/settings.json` (`mcpServers` key) to keep MCP server definitions separate from general Claude Code preferences.
+- User-global (`~/.mcp.json`) was chosen over project-local (`.mcp.json` inside the repo) because the server is a shared infrastructure concern — not specific to one sub-project within `~/Workspace/AI`.
+- `settings.local.json` (not `settings.json`) was used for `enabledMcpjsonServers` because the opt-in is machine-specific and should not be committed to git.
+
+---
+
+### 15.5 Quick Reference: When to Use Which Config File
+
+| Goal | Recommended file |
+|---|---|
+| Register a server available to all projects on the machine | `~/.mcp.json` |
+| Register a server specific to one project (team-shared) | `<project>/.mcp.json` |
+| Register a server via the older `settings.json` approach | `~/.claude/settings.json` → `mcpServers` |
+| Opt a project into servers from `.mcp.json` | `<project>/.claude/settings.local.json` → `enabledMcpjsonServers` |
+| Set environment variables for Claude Code sessions | `<project>/.claude/settings.json` → `env` |
+| Override project settings locally (personal, not committed) | `<project>/.claude/settings.local.json` |

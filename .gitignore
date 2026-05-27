@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .env
 .claude/
+.DS_Store
+*.pem
+*.der
